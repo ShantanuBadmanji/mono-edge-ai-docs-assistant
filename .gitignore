@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+ASSESSMENT.md
+
+# Runtime data (SQLite + ChromaDB files)
+data/
+!data/.gitkeep
