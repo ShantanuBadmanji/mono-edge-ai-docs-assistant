@@ -11,10 +11,12 @@ from app.config import settings
 from app.models import Ticket
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant that answers questions strictly from the provided document excerpts. "
-    "If the answer cannot be found in the excerpts, respond with exactly: "
-    "'The answer is not available in the provided documents.' "
-    "Do not use any prior knowledge beyond the excerpts provided."
+    "You are a helpful assistant. "
+    "When document excerpts are provided, answer strictly from them. "
+    "If the user asks to create or raise a ticket, always use the create_ticket tool — "
+    "no document context is needed for that. "
+    "For all other questions without excerpts, respond with exactly: "
+    "'The answer is not available in the provided documents.'"
 )
 
 _TOOLS = [
@@ -67,21 +69,20 @@ async def answer_question(
     docs = [d for d, dist in zip(raw_docs, raw_distances) if dist < DISTANCE_THRESHOLD]
     metas = [m for m, dist in zip(raw_metas, raw_distances) if dist < DISTANCE_THRESHOLD]
 
-    if not docs:
-        return {
-            "answer": "The answer is not available in the provided documents.",
-            "sources": [],
-        }
-
-    context = "\n\n".join(
-        f"[Source: {m['file_name']}, page {m['page']}]\n{doc}"
-        for doc, m in zip(docs, metas)
-    )
+    # Build user message — include doc context only when relevant chunks exist
+    if docs:
+        context = "\n\n".join(
+            f"[Source: {m['file_name']}, page {m['page']}]\n{doc}"
+            for doc, m in zip(docs, metas)
+        )
+        user_content = f"Document excerpts:\n{context}\n\nQuestion: {question}"
+    else:
+        user_content = question
 
     groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Document excerpts:\n{context}\n\nQuestion: {question}"},
+        {"role": "user", "content": user_content},
     ]
 
     response = await groq_client.chat.completions.create(
@@ -119,19 +120,24 @@ async def answer_question(
             messages=messages,
             temperature=0,
         )
-        answer = final.choices[0].message.content
-    else:
-        answer = message.content
+        return {"answer": final.choices[0].message.content, "sources": []}
+
+    # No tool call and no relevant docs — don't hallucinate
+    if not docs:
+        return {
+            "answer": "The answer is not available in the provided documents.",
+            "sources": [],
+        }
 
     seen: set[tuple] = set()
     sources = []
-    for m in metas:  # already filtered by distance threshold
+    for m in metas:
         key = (m["file_name"], m["page"])
         if key not in seen:
             seen.add(key)
             sources.append({"file_name": m["file_name"], "page": m["page"]})
 
-    return {"answer": answer, "sources": sources}
+    return {"answer": message.content, "sources": sources}
 
 
 async def _run_create_ticket(tool_call, db: AsyncSession) -> str:
