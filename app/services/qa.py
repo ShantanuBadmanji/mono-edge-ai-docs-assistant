@@ -56,8 +56,16 @@ async def answer_question(
         )
     )
 
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
+    # Filter to chunks with cosine distance < 0.5 (0 = identical, 2 = opposite)
+    DISTANCE_THRESHOLD = 0.75
+    raw_docs = results["documents"][0]
+    raw_metas = results["metadatas"][0]
+    raw_distances = results["distances"][0]
+
+    print(json.dumps({"raw_metas":raw_metas, "raw_distances" : raw_distances}, indent=4))
+
+    docs = [d for d, dist in zip(raw_docs, raw_distances) if dist < DISTANCE_THRESHOLD]
+    metas = [m for m, dist in zip(raw_metas, raw_distances) if dist < DISTANCE_THRESHOLD]
 
     if not docs:
         return {
@@ -117,7 +125,7 @@ async def answer_question(
 
     seen: set[tuple] = set()
     sources = []
-    for m in metas:
+    for m in metas:  # already filtered by distance threshold
         key = (m["file_name"], m["page"])
         if key not in seen:
             seen.add(key)

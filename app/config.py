@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     WEBHOOK_SECRET: str = "change-me"
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/data.db"
     CHROMA_PATH: str = "./data/chroma"
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_MODEL: str = "qwen/qwen3.8-27b"
 
 
 settings = Settings()
