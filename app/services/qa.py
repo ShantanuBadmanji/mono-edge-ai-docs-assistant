@@ -10,13 +10,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import Ticket
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. "
-    "When document excerpts are provided, answer strictly from them. "
-    "If the user asks to create or raise a ticket, always use the create_ticket tool — "
-    "no document context is needed for that. "
-    "For all other questions without excerpts, respond with exactly: "
-    "'The answer is not available in the provided documents.'"
+# Intent detection: short, focused only on whether to call a tool
+_INTENT_SYSTEM_PROMPT = (
+    "You are a router. "
+    "If the user wants to create or raise a support ticket, ALWAYS call the create_ticket tool immediately. "
+    "Infer a reasonable title from the user's message and choose a suitable priority. "
+    "Never ask for clarification — make your best guess and call the tool. "
+    "For everything else, reply with an empty response — do not answer the question."
+)
+
+# RAG answering: strict doc-only response
+_RAG_SYSTEM_PROMPT = (
+    "You are a helpful assistant that answers questions strictly from the provided document excerpts. "
+    "If the answer cannot be found in the excerpts, respond with exactly: "
+    "'The answer is not available in the provided documents.' "
+    "Do not use any prior knowledge beyond the excerpts provided."
 )
 
 _TOOLS = [
@@ -24,7 +32,7 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "create_ticket",
-            "description": "Create a support ticket in the system when the user explicitly asks to raise or create one.",
+            "description": "Create a support ticket when the user explicitly asks to raise or create one.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -41,6 +49,8 @@ _TOOLS = [
     }
 ]
 
+DISTANCE_THRESHOLD = 0.75
+
 
 async def answer_question(
     question: str,
@@ -48,6 +58,39 @@ async def answer_question(
     collection,
     db: AsyncSession,
 ) -> dict:
+    groq = AsyncGroq(api_key=settings.GROQ_API_KEY)
+
+    # Step 1 — intent detection (no RAG, no embed, no Chroma)
+    intent_resp = await groq.chat.completions.create(
+        model=settings.GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        tools=_TOOLS,
+        tool_choice="auto",
+        temperature=0,
+    )
+    intent_msg = intent_resp.choices[0].message
+
+    print("Intent Message: ", json.dumps(intent_msg, indent=4, default= lambda x: x.__dict__))
+
+    if intent_msg.tool_calls:
+        return await _handle_tool_call(intent_msg, db)
+
+    # Step 2 — RAG pipeline (only reached for non-tool intents)
+    return await _answer_from_rag(question, model, collection, groq)
+
+
+async def _handle_tool_call(intent_msg, db: AsyncSession) -> dict:
+    tool_call = intent_msg.tool_calls[0]
+    if tool_call.function.name != "create_ticket":
+        return {"answer": f"Unknown tool requested: {tool_call.function.name}", "sources": []}
+    tool_result = await _run_create_ticket(tool_call, db)
+    return {"answer": tool_result, "sources": []}
+
+
+async def _answer_from_rag(question: str, model, collection, groq: AsyncGroq) -> dict:
     q_embedding = await asyncio.to_thread(lambda: model.encode([question])[0].tolist())
 
     results = await asyncio.to_thread(
@@ -58,76 +101,32 @@ async def answer_question(
         )
     )
 
-    # Filter to chunks with cosine distance < 0.5 (0 = identical, 2 = opposite)
-    DISTANCE_THRESHOLD = 0.75
     raw_docs = results["documents"][0]
     raw_metas = results["metadatas"][0]
     raw_distances = results["distances"][0]
 
-    print(json.dumps({"raw_metas":raw_metas, "raw_distances" : raw_distances}, indent=4))
-
     docs = [d for d, dist in zip(raw_docs, raw_distances) if dist < DISTANCE_THRESHOLD]
     metas = [m for m, dist in zip(raw_metas, raw_distances) if dist < DISTANCE_THRESHOLD]
 
-    # Build user message — include doc context only when relevant chunks exist
-    if docs:
-        context = "\n\n".join(
-            f"[Source: {m['file_name']}, page {m['page']}]\n{doc}"
-            for doc, m in zip(docs, metas)
-        )
-        user_content = f"Document excerpts:\n{context}\n\nQuestion: {question}"
-    else:
-        user_content = question
-
-    groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
-    messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
-
-    response = await groq_client.chat.completions.create(
-        model=settings.GROQ_MODEL,
-        messages=messages,
-        tools=_TOOLS,
-        tool_choice="auto",
-        temperature=0,
-    )
-
-    message = response.choices[0].message
-
-    if message.tool_calls:
-        tool_call = message.tool_calls[0]
-        tool_result = await _run_create_ticket(tool_call, db)
-
-        messages.append(
-            {
-                "role": "assistant",
-                "content": message.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in message.tool_calls
-                ],
-            }
-        )
-        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
-
-        final = await groq_client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=messages,
-            temperature=0,
-        )
-        return {"answer": final.choices[0].message.content, "sources": []}
-
-    # No tool call and no relevant docs — don't hallucinate
     if not docs:
         return {
             "answer": "The answer is not available in the provided documents.",
             "sources": [],
         }
+
+    context = "\n\n".join(
+        f"[Source: {m['file_name']}, page {m['page']}]\n{doc}"
+        for doc, m in zip(docs, metas)
+    )
+
+    response = await groq.chat.completions.create(
+        model=settings.GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": _RAG_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Document excerpts:\n{context}\n\nQuestion: {question}"},
+        ],
+        temperature=0,
+    )
 
     seen: set[tuple] = set()
     sources = []
@@ -137,16 +136,13 @@ async def answer_question(
             seen.add(key)
             sources.append({"file_name": m["file_name"], "page": m["page"]})
 
-    return {"answer": message.content, "sources": sources}
+    return {"answer": response.choices[0].message.content, "sources": sources}
 
 
 async def _run_create_ticket(tool_call, db: AsyncSession) -> str:
     class CreateTicketInput(BaseModel):
         title: str
         priority: Literal["low", "medium", "high"]
-
-    if tool_call.function.name != "create_ticket":
-        return "Error: unknown tool requested"
 
     try:
         args = json.loads(tool_call.function.arguments)
