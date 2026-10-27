@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import json
 
-import pytest
 from sqlalchemy import select
 
 import app.database as db_module
