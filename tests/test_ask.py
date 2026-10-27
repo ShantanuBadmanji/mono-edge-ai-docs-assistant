@@ -1,5 +1,8 @@
 import pytest
 
+import os
+
+api_key = os.environ["GROQ_API_KEY"]
 
 async def test_ask_no_documents_returns_not_available(client):
     """When the vector store is empty the service must not hallucinate."""
